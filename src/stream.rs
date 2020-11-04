@@ -26,6 +26,8 @@
 
 use std::cmp;
 
+use std::sync::Arc;
+
 use std::collections::hash_map;
 
 use std::collections::BTreeMap;
@@ -1139,9 +1141,9 @@ impl SendBuf {
             // Advance the buffer's position if the retransmit range is past
             // the buffer's starting offset.
             buf.pos = if off > buf.off && off <= buf.max_off() {
-                cmp::min(buf.pos, (off - buf.off) as usize)
+                cmp::min(buf.pos, buf.start + (off - buf.off) as usize)
             } else {
-                0
+                buf.start
             };
 
             self.pos = cmp::min(self.pos, i);
@@ -1246,13 +1248,22 @@ impl SendBuf {
 #[derive(Clone, Debug, Default, Eq)]
 pub struct RangeBuf {
     /// The internal buffer holding the data.
-    data: Vec<u8>,
+    ///
+    /// To avoid neeless allocations when a RangeBuf is split, this can be
+    /// shared between multiple RangeBuf objects, and sliced using the `start`
+    /// and `len` values.
+    data: Arc<Vec<u8>>,
 
-    /// The starting offset within `data`. This allows partially consuming a
-    /// buffer without duplicating the data.
+    /// The initial offset within the internal buffer.
+    start: usize,
+
+    /// The current offset within the internal buffer.
     pos: usize,
 
-    /// The starting offset within a stream.
+    /// The number of bytes in the buffer, from the initial offset.
+    len: usize,
+
+    /// The offset of the buffer within a stream.
     off: u64,
 
     /// Whether this contains the final byte in the stream.
@@ -1263,8 +1274,10 @@ impl RangeBuf {
     /// Creates a new `RangeBuf` from the given slice.
     pub(crate) fn from(buf: &[u8], off: u64, fin: bool) -> RangeBuf {
         RangeBuf {
-            data: Vec::from(buf),
+            data: Arc::new(Vec::from(buf)),
+            start: 0,
             pos: 0,
+            len: buf.len(),
             off,
             fin,
         }
@@ -1277,7 +1290,7 @@ impl RangeBuf {
 
     /// Returns the starting offset of `self`.
     pub fn off(&self) -> u64 {
-        self.off + self.pos as u64
+        (self.off - self.start as u64) + self.pos as u64
     }
 
     /// Returns the final offset of `self`.
@@ -1287,7 +1300,7 @@ impl RangeBuf {
 
     /// Returns the length of `self`.
     pub fn len(&self) -> usize {
-        self.data.len() - self.pos
+        self.len - (self.pos - self.start)
     }
 
     /// Returns true if `self` has a length of zero bytes.
@@ -1303,14 +1316,16 @@ impl RangeBuf {
     /// Splits the buffer into two at the given index.
     pub fn split_off(&mut self, at: usize) -> RangeBuf {
         let buf = RangeBuf {
-            data: self.data.split_off(at),
-            pos: self.pos.saturating_sub(at),
+            data: self.data.clone(),
+            start: self.start + at,
+            pos: cmp::max(self.pos, self.start + at),
+            len: self.len - at,
             off: self.off + at as u64,
             fin: self.fin,
         };
 
-        self.pos = cmp::min(self.pos, at);
-
+        self.pos = cmp::min(self.pos, self.start + at);
+        self.len = at;
         self.fin = false;
 
         buf
@@ -1321,13 +1336,7 @@ impl std::ops::Deref for RangeBuf {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.data[self.pos..]
-    }
-}
-
-impl std::ops::DerefMut for RangeBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.data[self.pos..]
+        &self.data[self.pos..self.start + self.len]
     }
 }
 
@@ -2763,5 +2772,120 @@ mod tests {
         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((2, false)));
         assert_eq!(stream.send.off_front(), 20);
         assert_eq!(&buf[..2], b"ro");
+    }
+
+    #[test]
+    fn rangebuf_split_off() {
+        let mut buf = RangeBuf::from(b"helloworld", 5, true);
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 0);
+        assert_eq!(buf.len, 10);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, true);
+
+        assert_eq!(buf.len(), 10);
+        assert_eq!(buf.off(), 5);
+        assert_eq!(buf.fin(), true);
+
+        assert_eq!(&buf[..], b"helloworld");
+
+        // Advance buffer.
+        buf.consume(5);
+
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 5);
+        assert_eq!(buf.len, 10);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, true);
+
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.off(), 10);
+        assert_eq!(buf.fin(), true);
+
+        assert_eq!(&buf[..], b"world");
+
+        // Split buffer before position.
+        let mut new_buf = buf.split_off(3);
+
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 3);
+        assert_eq!(buf.len, 3);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, false);
+
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.off(), 8);
+        assert_eq!(buf.fin(), false);
+
+        assert_eq!(&buf[..], b"");
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 5);
+        assert_eq!(new_buf.len, 7);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, true);
+
+        assert_eq!(new_buf.len(), 5);
+        assert_eq!(new_buf.off(), 10);
+        assert_eq!(new_buf.fin(), true);
+
+        assert_eq!(&new_buf[..], b"world");
+
+        // Advance buffer.
+        new_buf.consume(2);
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 7);
+        assert_eq!(new_buf.len, 7);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, true);
+
+        assert_eq!(new_buf.len(), 3);
+        assert_eq!(new_buf.off(), 12);
+        assert_eq!(new_buf.fin(), true);
+
+        assert_eq!(&new_buf[..], b"rld");
+
+        // Split buffer after position.
+        let mut new_new_buf = new_buf.split_off(5);
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 7);
+        assert_eq!(new_buf.len, 5);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, false);
+
+        assert_eq!(new_buf.len(), 1);
+        assert_eq!(new_buf.off(), 12);
+        assert_eq!(new_buf.fin(), false);
+
+        assert_eq!(&new_buf[..], b"r");
+
+        assert_eq!(new_new_buf.start, 8);
+        assert_eq!(new_new_buf.pos, 8);
+        assert_eq!(new_new_buf.len, 2);
+        assert_eq!(new_new_buf.off, 13);
+        assert_eq!(new_new_buf.fin, true);
+
+        assert_eq!(new_new_buf.len(), 2);
+        assert_eq!(new_new_buf.off(), 13);
+        assert_eq!(new_new_buf.fin(), true);
+
+        assert_eq!(&new_new_buf[..], b"ld");
+
+        // Advance buffer.
+        new_new_buf.consume(2);
+
+        assert_eq!(new_new_buf.start, 8);
+        assert_eq!(new_new_buf.pos, 10);
+        assert_eq!(new_new_buf.len, 2);
+        assert_eq!(new_new_buf.off, 13);
+        assert_eq!(new_new_buf.fin, true);
+
+        assert_eq!(new_new_buf.len(), 0);
+        assert_eq!(new_new_buf.off(), 15);
+        assert_eq!(new_new_buf.fin(), true);
+
+        assert_eq!(&new_new_buf[..], b"");
     }
 }
